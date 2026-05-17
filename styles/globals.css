@@ -1,0 +1,18 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { font-size: 14px; }
+
+body {
+  background: #0d0f0e;
+  color: #e8ede9;
+  font-family: 'DM Mono', 'Courier New', monospace;
+  min-height: 100vh;
+  padding: 48px 20px 80px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+* { scrollbar-width: thin; scrollbar-color: #3a3f3c transparent; }
+*::-webkit-scrollbar { width: 4px; }
+*::-webkit-scrollbar-thumb { background: #3a3f3c; border-radius: 2px; }
