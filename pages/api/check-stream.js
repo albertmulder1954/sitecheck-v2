@@ -1,12 +1,13 @@
-// pages/api/check.js — SiteCheck V2 (beveiligd + vertrouwensscores)
+// pages/api/check-stream.js — SiteCheck V2 SSE streaming endpoint
 
+export const config = { api: { responseLimit: false } }
 export const maxDuration = 60
 
 import Anthropic from '@anthropic-ai/sdk'
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
-// ─── Prompts ───────────────────────────────────────────────────────────────
+// ─── Prompts (identiek aan check.js) ──────────────────────────────────────
 
 const CLAIM_EXTRACTION_PROMPT = `Je bent een gespecialiseerde fact-check analist voor webinhoud.
 Je krijgt de gecombineerde tekst van een website aangeleverd (hoofdpagina + sub-pagina's). Jouw taak:
@@ -115,13 +116,9 @@ function log(level, fase, msg, meta = {}) {
 function validateUrl(rawUrl) {
   let parsed
   try { parsed = new URL(rawUrl) } catch { throw new Error('Ongeldig URL-formaat') }
-  if (!['http:', 'https:'].includes(parsed.protocol)) {
-    throw new Error('Alleen HTTP en HTTPS URLs zijn toegestaan')
-  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Alleen HTTP en HTTPS URLs zijn toegestaan')
   const BLOCKED = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|0\.0\.0\.0|::1$)/i
-  if (BLOCKED.test(parsed.hostname)) {
-    throw new Error('Privé-netwerkadressen zijn niet toegestaan')
-  }
+  if (BLOCKED.test(parsed.hostname)) throw new Error('Privé-netwerkadressen zijn niet toegestaan')
   return parsed.href
 }
 
@@ -201,7 +198,7 @@ async function fetchPageRaw(url, timeoutMs = 10000) {
     return { html }
   } catch (err) {
     clearTimeout(tid)
-    return { html: '', error: err.name === 'AbortError' ? 'Timeout na ' + timeoutMs + 'ms' : err.message }
+    return { html: '', error: err.name === 'AbortError' ? 'Timeout' : err.message }
   }
 }
 
@@ -214,10 +211,7 @@ async function fetchSource(url, maxChars = 8000) {
 async function isRobotsAllowed(baseUrl) {
   try {
     const robotsUrl = new URL('/robots.txt', baseUrl).href
-    const res = await fetch(robotsUrl, {
-      headers: { 'User-Agent': 'SiteCheckV2/1.0' },
-      signal: AbortSignal.timeout(3000),
-    })
+    const res = await fetch(robotsUrl, { headers: { 'User-Agent': 'SiteCheckV2/1.0' }, signal: AbortSignal.timeout(3000) })
     if (!res.ok) return true
     const text = await res.text()
     let applies = false
@@ -259,125 +253,152 @@ export default async function handler(req, res) {
   }
 
   if (!process.env.ANTHROPIC_API_KEY) {
-    return res.status(500).json({ error: 'ANTHROPIC_API_KEY niet ingesteld op de server' })
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY niet ingesteld' })
   }
 
-  log('info', 0, 'Start analyse', { url, ip })
+  // SSE setup
+  res.setHeader('Content-Type', 'text/event-stream')
+  res.setHeader('Cache-Control', 'no-cache, no-transform')
+  res.setHeader('Connection', 'keep-alive')
+  res.setHeader('X-Accel-Buffering', 'no')
+  if (res.socket) res.socket.setNoDelay(true)
 
-  // ─── FASE 0: Pagina + sub-pagina's ───
-  let pageText, subPageTexts = []
+  function send(data) {
+    try { res.write(`data: ${JSON.stringify(data)}\n\n`) } catch {}
+  }
+
+  log('info', 0, 'Stream start', { url, ip })
+
   try {
-    const { html, error } = await fetchPageRaw(url)
-    if (error || !html) return res.status(502).json({ error: `Pagina niet bereikbaar: ${error}` })
+    // ─── FASE 0 ───
+    send({ type: 'progress', fase: 0, bericht: 'Pagina ophalen...' })
 
-    pageText = stripHtml(html).slice(0, 12000)
-    if (pageText.length < 50) return res.status(502).json({ error: 'Pagina bevat geen leesbare tekst' })
+    const { html: pageHtml, error: pageError } = await fetchPageRaw(url)
+    if (pageError || !pageHtml) {
+      send({ type: 'error', bericht: `Pagina niet bereikbaar: ${pageError}` })
+      return res.end()
+    }
 
+    const pageText = stripHtml(pageHtml).slice(0, 12000)
+    if (pageText.length < 50) {
+      send({ type: 'error', bericht: 'Pagina bevat geen leesbare tekst' })
+      return res.end()
+    }
+
+    let subPageTexts = []
     const robotsOk = await isRobotsAllowed(new URL(url).origin)
     if (robotsOk) {
-      const subUrls = extractInternalLinks(html, url)
+      send({ type: 'progress', fase: 0, bericht: "Sub-pagina's ontdekken..." })
+      const subUrls = extractInternalLinks(pageHtml, url)
       if (subUrls.length > 0) {
+        send({ type: 'progress', fase: 0, bericht: `${subUrls.length} sub-pagina's ophalen...` })
         const results = await Promise.all(subUrls.map(u => fetchSource(u, 5000)))
         subPageTexts = results.filter(r => r.text)
       }
     } else {
-      log('info', 0, 'robots.txt blokkeert crawling', { url })
+      send({ type: 'progress', fase: 0, bericht: 'robots.txt: alleen hoofdpagina gecrawld' })
     }
-  } catch (err) {
-    log('error', 0, err.message)
-    return res.status(502).json({ error: `Pagina ophalen mislukt: ${err.message}` })
-  }
+    send({ type: 'subpaginas', urls: subPageTexts.map(s => s.url) })
 
-  // ─── FASE 1: Claim-extractie ───
-  let claims
-  try {
+    // ─── FASE 1 ───
+    send({ type: 'progress', fase: 1, bericht: 'Beweringen identificeren via Claude...' })
+
     const combinedText = [
       `=== Hoofdpagina: ${url} ===\n${pageText}`,
       ...subPageTexts.map(s => `=== Sub-pagina: ${s.url} ===\n${s.text}`),
     ].join('\n\n')
 
-    const r = await client.messages.create({
+    let claims
+    const claimsRes = await client.messages.create({
       model: 'claude-sonnet-4-6', max_tokens: 2048,
       system: [{ type: 'text', text: CLAIM_EXTRACTION_PROMPT, cache_control: { type: 'ephemeral' } }],
       messages: [{ role: 'user', content: `URL: ${url}\n\nWebsite-inhoud:\n${combinedText}` }],
     })
-    claims = parseJson(r.content.filter(b => b.type === 'text').map(b => b.text).join(''))
+    claims = parseJson(claimsRes.content.filter(b => b.type === 'text').map(b => b.text).join(''))
     log('info', 1, 'Claims extracted', { count: claims.beweringen?.length })
-  } catch (err) {
-    log('error', 1, err.message)
-    return res.status(502).json({ error: 'Claim-extractie mislukt: ' + err.message })
-  }
 
-  if (!claims.beweringen?.length) {
-    return res.status(200).json({
-      onderwerp: claims.onderwerp || 'Onbekend', oordeel: 'twijfelachtig',
-      items: [], bronnen: [], subPaginas: subPageTexts.map(s => s.url), iteraties: 1,
-      conclusie: 'Er zijn geen verifieerbare feitelijke beweringen gevonden op deze website.',
-    })
-  }
+    if (!claims.beweringen?.length) {
+      send({ type: 'result', data: {
+        onderwerp: claims.onderwerp || 'Onbekend', oordeel: 'twijfelachtig',
+        items: [], bronnen: [], subPaginas: subPageTexts.map(s => s.url), iteraties: 1,
+        conclusie: 'Er zijn geen verifieerbare feitelijke beweringen gevonden op deze website.',
+      }})
+      return res.end()
+    }
 
-  // ─── FASE 2: Feitcontrole ───
-  let factCheck
-  const fase2Urls = [...new Set(claims.beweringen.flatMap(b => b.bron_urls?.[0] ? [b.bron_urls[0]] : []))].slice(0, 3)
-  const fase2Bronnen = (await Promise.all(fase2Urls.map(fetchSource))).filter(b => b.text)
+    send({ type: 'progress', fase: 1, bericht: `${claims.beweringen.length} beweringen geïdentificeerd` })
 
-  try {
+    // ─── FASE 2 ───
+    send({ type: 'progress', fase: 2, bericht: 'Officiële bronnen ophalen...' })
+
+    const fase2Urls = [...new Set(claims.beweringen.flatMap(b => b.bron_urls?.[0] ? [b.bron_urls[0]] : []))].slice(0, 3)
+    const fase2Bronnen = (await Promise.all(fase2Urls.map(fetchSource))).filter(b => b.text)
+
+    send({ type: 'progress', fase: 2, bericht: `${fase2Bronnen.length} bronnen geladen — feitcontrole uitvoeren...` })
+
+    let factCheck
     const bronText = fase2Bronnen.map((b, i) => `--- Bron ${i + 1}: ${b.url} ---\n${b.text}`).join('\n\n')
     const beweringenText = claims.beweringen.map(b => `[${b.id}] ${b.tekst}`).join('\n')
-    const r = await client.messages.create({
+    const factRes = await client.messages.create({
       model: 'claude-sonnet-4-6', max_tokens: 4096,
       system: [{ type: 'text', text: FACT_CHECK_PROMPT, cache_control: { type: 'ephemeral' } }],
       messages: [{ role: 'user', content: `Originele website: ${url}\nOnderwerp: ${claims.onderwerp}\n\nBeweringen:\n${beweringenText}\n\nBronmateriaal:\n${bronText || 'Geen bronnen beschikbaar.'}` }],
     })
-    factCheck = parseJson(r.content.filter(b => b.type === 'text').map(b => b.text).join(''))
+    factCheck = parseJson(factRes.content.filter(b => b.type === 'text').map(b => b.text).join(''))
     factCheck.items = (factCheck.items || []).map(i => ({ ...i, bijgewerkt: false }))
     log('info', 2, 'Fact-check complete', { oordeel: factCheck.oordeel })
-  } catch (err) {
-    log('error', 2, err.message)
-    return res.status(502).json({ error: 'Feitcontrole mislukt: ' + err.message })
-  }
 
-  // ─── FASE 3: Iteratieve verdieping ───
-  let iteraties = 1
-  const onzekere = factCheck.items.filter(i => i.status === 'onzeker' || i.status === 'niet_verifieerbaar')
+    // ─── FASE 3 ───
+    let iteraties = 1
+    const onzekere = factCheck.items.filter(i => i.status === 'onzeker' || i.status === 'niet_verifieerbaar')
 
-  if (onzekere.length > 0) {
-    const used = new Set(fase2Urls)
-    const extra = []
-    for (const item of onzekere) {
-      const claim = claims.beweringen.find(b => b.id === item.id)
-      for (const fb of (claim?.bron_urls || []).slice(1)) {
-        if (!used.has(fb) && extra.length < 2) { extra.push(fb); used.add(fb) }
+    if (onzekere.length > 0) {
+      send({ type: 'progress', fase: 3, bericht: `${onzekere.length} onzekere bewering${onzekere.length === 1 ? '' : 'en'} heronderzoeken...` })
+      const used = new Set(fase2Urls)
+      const extra = []
+      for (const item of onzekere) {
+        const claim = claims.beweringen.find(b => b.id === item.id)
+        for (const fb of (claim?.bron_urls || []).slice(1)) {
+          if (!used.has(fb) && extra.length < 2) { extra.push(fb); used.add(fb) }
+        }
       }
-    }
-    if (extra.length > 0) {
-      const extraBronnen = (await Promise.all(extra.map(fetchSource))).filter(b => b.text)
-      if (extraBronnen.length > 0) {
-        try {
-          const r = await client.messages.create({
-            model: 'claude-sonnet-4-6', max_tokens: 2048,
-            system: [{ type: 'text', text: REFINEMENT_PROMPT, cache_control: { type: 'ephemeral' } }],
-            messages: [{ role: 'user', content: `Onzekere beweringen:\n${onzekere.map(i => `[${i.id}] ${i.bewering} (${i.status})`).join('\n')}\n\nAanvullende bronnen:\n${extraBronnen.map((b, i) => `--- Extra bron ${i + 1}: ${b.url} ---\n${b.text}`).join('\n\n')}` }],
-          })
-          const refined = parseJson(r.content.filter(b => b.type === 'text').map(b => b.text).join(''))
-          for (const u of (refined.updates || [])) {
-            const idx = factCheck.items.findIndex(i => i.id === u.id)
-            if (idx >= 0) factCheck.items[idx] = { ...factCheck.items[idx], ...u, bijgewerkt: true }
+      if (extra.length > 0) {
+        const extraBronnen = (await Promise.all(extra.map(fetchSource))).filter(b => b.text)
+        if (extraBronnen.length > 0) {
+          try {
+            const refineRes = await client.messages.create({
+              model: 'claude-sonnet-4-6', max_tokens: 2048,
+              system: [{ type: 'text', text: REFINEMENT_PROMPT, cache_control: { type: 'ephemeral' } }],
+              messages: [{ role: 'user', content: `Onzekere beweringen:\n${onzekere.map(i => `[${i.id}] ${i.bewering} (${i.status})`).join('\n')}\n\nAanvullende bronnen:\n${extraBronnen.map((b, i) => `--- Extra bron ${i + 1}: ${b.url} ---\n${b.text}`).join('\n\n')}` }],
+            })
+            const refined = parseJson(refineRes.content.filter(b => b.type === 'text').map(b => b.text).join(''))
+            for (const u of (refined.updates || [])) {
+              const idx = factCheck.items.findIndex(i => i.id === u.id)
+              if (idx >= 0) factCheck.items[idx] = { ...factCheck.items[idx], ...u, bijgewerkt: true }
+            }
+            factCheck.oordeel = herberekeneOordeel(factCheck.items)
+            iteraties = 2
+            send({ type: 'progress', fase: 3, bericht: `${refined.updates?.length || 0} beweringen bijgesteld` })
+          } catch (err) {
+            log('warn', 3, 'Refinement mislukt (non-fatal): ' + err.message)
           }
-          factCheck.oordeel = herberekeneOordeel(factCheck.items)
-          iteraties = 2
-          log('info', 3, 'Refinement complete', { updated: refined.updates?.length })
-        } catch (err) {
-          log('warn', 3, 'Refinement mislukt (non-fatal): ' + err.message)
         }
       }
     }
-  }
 
-  return res.status(200).json({
-    ...factCheck,
-    bronnen: fase2Bronnen.map(b => b.url),
-    subPaginas: subPageTexts.map(s => s.url),
-    iteraties,
-  })
+    const finalResult = {
+      ...factCheck,
+      bronnen: fase2Bronnen.map(b => b.url),
+      subPaginas: subPageTexts.map(s => s.url),
+      iteraties,
+    }
+    log('info', 'done', 'Stream complete', { oordeel: finalResult.oordeel, iteraties })
+    send({ type: 'result', data: finalResult })
+    res.end()
+
+  } catch (err) {
+    log('error', 'fatal', err.message)
+    send({ type: 'error', bericht: err.message || 'Onbekende serverfout' })
+    res.end()
+  }
 }
