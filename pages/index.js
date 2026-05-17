@@ -42,14 +42,23 @@ export default function Home() {
         body: JSON.stringify({ url: url.trim() }),
       })
 
-      await new Promise(r => setTimeout(r, 1200))
-      addLog('Beweringen analyseren via Claude (fase 1)...')
+      await new Promise(r => setTimeout(r, 600))
+      addLog("Sub-pagina's van de website ontdekken...")
+
+      await new Promise(r => setTimeout(r, 1000))
+      addLog('Diepere lagen ophalen en analyseren...')
 
       await new Promise(r => setTimeout(r, 1200))
-      addLog('Bronnen ophalen bij officiële documentatie...')
+      addLog('Beweringen identificeren via Claude (fase 1)...')
+
+      await new Promise(r => setTimeout(r, 1200))
+      addLog('Officiële documentatiebronnen ophalen...')
 
       await new Promise(r => setTimeout(r, 800))
       addLog('Beweringen toetsen aan bronteksten (fase 2)...')
+
+      await new Promise(r => setTimeout(r, 2500))
+      addLog('Onzekere beweringen verder onderzoeken (fase 3)...')
 
       const res = await fetchPromise
       const data = await res.json()
@@ -57,7 +66,8 @@ export default function Home() {
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
 
       const count = data.items?.length ?? 0
-      addLog(`Klaar — ${count} bewering${count === 1 ? '' : 'en'} gecontroleerd.`, 'done')
+      const iter = data.iteraties ?? 1
+      addLog(`Klaar — ${count} bewering${count === 1 ? '' : 'en'} gecontroleerd in ${iter} iteratie${iter === 1 ? '' : 's'}.`, 'done')
       setResult(data)
     } catch (err) {
       addLog('Fout: ' + err.message, 'err')
@@ -81,6 +91,10 @@ export default function Home() {
 
   const oordeelInfo = result ? (OORDEEL_MAP[result.oordeel] || OORDEEL_MAP.twijfelachtig) : null
 
+  const totalBronnen = result
+    ? (result.bronnen?.length ?? 0) + (result.subPaginas?.length ?? 0) + 1
+    : 0
+
   return (
     <div style={{ width: '100%', maxWidth: 760 }}>
 
@@ -91,7 +105,7 @@ export default function Home() {
           <span style={{ fontSize: 13, fontWeight: 400, color: '#5a635c', marginLeft: 8, fontFamily: "'DM Mono', monospace", letterSpacing: 0 }}>v2</span>
         </div>
         <div style={{ color: '#5a635c', fontSize: 11, letterSpacing: '.5px', textTransform: 'uppercase' }}>
-          Feitelijke verificatie via officiële bronnen
+          Feitelijke verificatie via officiële bronnen · diepte-analyse
         </div>
       </div>
 
@@ -115,7 +129,7 @@ export default function Home() {
           </button>
         </div>
         <div style={{ marginTop: 10, fontSize: 11, color: '#5a635c' }}>
-          Controleert beweringen op de pagina via Microsoft Learn en andere officiële bronnen.
+          Crawlt sub-pagina's · controleert beweringen via Microsoft Learn & andere officiële bronnen · heronderzoekt onzekere claims
         </div>
       </div>
 
@@ -126,7 +140,7 @@ export default function Home() {
             <span style={{ width: 7, height: 7, borderRadius: '50%', background: loading ? '#5ec46a' : '#3a3f3c', display: 'inline-block', animation: loading ? 'blink .8s infinite' : 'none' }} />
             {loading ? 'Analyseren…' : 'Analyse voltooid'}
           </div>
-          <div style={{ padding: '14px 18px', fontSize: 12, color: '#8a9489', lineHeight: 1.9, maxHeight: 160, overflowY: 'auto' }}>
+          <div style={{ padding: '14px 18px', fontSize: 12, color: '#8a9489', lineHeight: 1.9, maxHeight: 180, overflowY: 'auto' }}>
             {logLines.map((l, i) => (
               <div key={i} style={{ color: l.type === 'done' ? '#5ec46a' : l.type === 'err' ? '#d95f5f' : '#8a9489' }}>
                 › {l.msg}
@@ -146,8 +160,11 @@ export default function Home() {
               <div>
                 <div style={{ fontSize: 10, color: '#5a635c', textTransform: 'uppercase', letterSpacing: '.4px', marginBottom: 2 }}>Oordeel</div>
                 <div style={{ fontFamily: "'Fraunces', Georgia, serif", fontSize: 22, fontWeight: 600, color: oordeelInfo.color }}>{oordeelInfo.label}</div>
+                <div style={{ fontSize: 10, color: '#5a635c', marginTop: 3 }}>
+                  {result.iteraties === 2 ? '↺ herzien na 2 iteraties' : '1 iteratie'} · {totalBronnen} bron{totalBronnen === 1 ? '' : 'nen'}
+                </div>
               </div>
-              <div style={{ width: 1, height: 36, background: '#2a2e2b', flexShrink: 0 }} />
+              <div style={{ width: 1, height: 44, background: '#2a2e2b', flexShrink: 0 }} />
               <div>
                 <div style={{ fontSize: 10, color: '#5a635c', textTransform: 'uppercase', letterSpacing: '.4px', marginBottom: 2 }}>Onderwerp</div>
                 <div style={{ fontSize: 14, color: '#e8ede9' }}>{esc(result.onderwerp)}</div>
@@ -168,18 +185,43 @@ export default function Home() {
             </div>
           </div>
 
-          {/* Bronnen */}
-          {result.bronnen?.length > 0 && (
-            <div style={{ ...styles.card, padding: '12px 18px' }}>
-              <div style={{ fontSize: 10, color: '#5a635c', textTransform: 'uppercase', letterSpacing: '.4px', marginBottom: 8 }}>Geraadpleegde bronnen</div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                {result.bronnen.map((bron, i) => (
-                  <a key={i} href={bron} target="_blank" rel="noopener noreferrer"
-                    style={{ fontSize: 11, color: '#5ec46a', textDecoration: 'none', wordBreak: 'break-all' }}>
-                    ↗ {bron}
-                  </a>
-                ))}
-              </div>
+          {/* Geanalyseerde pagina's */}
+          {(result.subPaginas?.length > 0 || true) && (
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+
+              {/* Sub-pagina's */}
+              {result.subPaginas?.length > 0 && (
+                <div style={{ ...styles.card, flex: 1, minWidth: 200, padding: '12px 18px' }}>
+                  <div style={{ fontSize: 10, color: '#5a635c', textTransform: 'uppercase', letterSpacing: '.4px', marginBottom: 8 }}>Geanalyseerde pagina's</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    <a href={url} target="_blank" rel="noopener noreferrer"
+                      style={{ fontSize: 11, color: '#8a9489', textDecoration: 'none', wordBreak: 'break-all' }}>
+                      ↗ {url.length > 55 ? url.slice(0, 55) + '…' : url}
+                    </a>
+                    {result.subPaginas.map((p, i) => (
+                      <a key={i} href={p} target="_blank" rel="noopener noreferrer"
+                        style={{ fontSize: 11, color: '#5ec46a', textDecoration: 'none', wordBreak: 'break-all' }}>
+                        ↗ {p.length > 55 ? p.slice(0, 55) + '…' : p}
+                      </a>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Geraadpleegde bronnen */}
+              {result.bronnen?.length > 0 && (
+                <div style={{ ...styles.card, flex: 1, minWidth: 200, padding: '12px 18px' }}>
+                  <div style={{ fontSize: 10, color: '#5a635c', textTransform: 'uppercase', letterSpacing: '.4px', marginBottom: 8 }}>Geraadpleegde bronnen</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    {result.bronnen.map((bron, i) => (
+                      <a key={i} href={bron} target="_blank" rel="noopener noreferrer"
+                        style={{ fontSize: 11, color: '#4a9fd4', textDecoration: 'none', wordBreak: 'break-all' }}>
+                        ↗ {bron.length > 55 ? bron.slice(0, 55) + '…' : bron}
+                      </a>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -188,8 +230,16 @@ export default function Home() {
             const s = STATUS_MAP[item.status] || STATUS_MAP.niet_verifieerbaar
             const bgCard = s.bg.replace('.15', '.07')
             return (
-              <div key={i} style={{ borderRadius: 10, padding: '14px 16px', border: `1px solid ${s.color}33`, borderLeft: `3px solid ${s.color}`, background: bgCard }}>
-                <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', marginBottom: 6 }}>
+              <div key={i} style={{ borderRadius: 10, padding: '14px 16px', border: `1px solid ${s.color}33`, borderLeft: `3px solid ${s.color}`, background: bgCard, position: 'relative' }}>
+
+                {/* Herzien badge */}
+                {item.bijgewerkt && (
+                  <div style={{ position: 'absolute', top: 10, right: 12, fontSize: 9, color: '#5ec46a', background: 'rgba(94,196,106,.15)', padding: '2px 7px', borderRadius: 4, letterSpacing: '.4px', textTransform: 'uppercase' }}>
+                    ↺ Herzien
+                  </div>
+                )}
+
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', marginBottom: 6, paddingRight: item.bijgewerkt ? 72 : 0 }}>
                   <span style={{ fontSize: 9, fontWeight: 500, textTransform: 'uppercase', letterSpacing: '.6px', padding: '2px 7px', borderRadius: 4, background: s.bg, color: s.color, flexShrink: 0 }}>
                     {s.label}
                   </span>
@@ -197,6 +247,11 @@ export default function Home() {
                 </div>
                 {item.uitleg && (
                   <div style={{ fontSize: 12, color: '#8a9489', marginBottom: 4 }}>{esc(item.uitleg)}</div>
+                )}
+                {item.bijgewerkt && (
+                  <div style={{ fontSize: 10, color: '#5a635c', marginBottom: 4, fontStyle: 'italic' }}>
+                    Status bijgesteld na aanvullend brononderzoek
+                  </div>
                 )}
                 {item.citaat && (
                   <div style={{ fontSize: 11, color: '#5a635c', marginTop: 5, paddingLeft: 10, borderLeft: '2px solid #3a3f3c', fontStyle: 'italic' }}>
@@ -218,7 +273,7 @@ export default function Home() {
           {/* Geen beweringen */}
           {sortedItems.length === 0 && (
             <div style={{ ...styles.card, color: '#5a635c', fontSize: 13, textAlign: 'center', padding: 32 }}>
-              Geen verifieerbare beweringen gevonden op deze pagina.
+              Geen verifieerbare beweringen gevonden op deze website.
             </div>
           )}
 

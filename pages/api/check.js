@@ -1,15 +1,17 @@
-// pages/api/check.js — SiteCheck V2
-// Twee-fase pipeline: claim-extractie → bronnen ophalen → feitcontrole
+// pages/api/check.js — SiteCheck V2 (uitgebreid)
+// Drie-fase pipeline: sub-pagina crawling → claim-extractie → feitcontrole → iteratieve verdieping
+
+export const maxDuration = 60
 
 import Anthropic from '@anthropic-ai/sdk'
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
 const CLAIM_EXTRACTION_PROMPT = `Je bent een gespecialiseerde fact-check analist voor webinhoud.
-Je krijgt de tekst van een webpagina aangeleverd. Jouw taak:
-1. Bepaal het hoofdonderwerp van de pagina
-2. Identificeer tot 10 specifieke, controleerbare feitelijke beweringen
-3. Suggereer voor elke bewering de meest relevante officiële documentatie-URL
+Je krijgt de gecombineerde tekst van een website aangeleverd (hoofdpagina + sub-pagina's). Jouw taak:
+1. Bepaal het hoofdonderwerp van de website
+2. Identificeer tot 12 specifieke, controleerbare feitelijke beweringen
+3. Suggereer per bewering 3 gerankte officiële documentatie-URLs (primair + 2 fallbacks)
 
 BEKENDE GEZAGHEBBENDE BRONNEN (gebruik deze bij voorkeur):
 - Microsoft 365 Copilot: https://learn.microsoft.com/en-us/copilot/microsoft-365/
@@ -34,14 +36,14 @@ Formaat:
       "id": 1,
       "tekst": "De exacte bewering uit de pagina (max 150 tekens)",
       "categorie": "functionaliteit" of "prijs" of "integratie" of "beveiliging" of "prestaties" of "algemeen",
-      "bron_urls": ["https://..."]
+      "bron_urls": ["primaire_url", "fallback_url_1", "fallback_url_2"]
     }
   ]
 }
-Max 10 beweringen. Selecteer alleen controleerbare feitelijke beweringen, geen meningen of marketing-taal.`
+Max 12 beweringen. Selecteer alleen controleerbare feitelijke beweringen, geen meningen of marketing-taal.`
 
 const FACT_CHECK_PROMPT = `Je bent een nauwkeurige fact-checker. Je krijgt:
-1. Een lijst van beweringen afkomstig van een webpagina
+1. Een lijst van beweringen afkomstig van een website
 2. Tekst uit officiële documentatiebronnen
 
 Controleer elke bewering aan de hand van de bronteksten.
@@ -59,10 +61,11 @@ Formaat:
       "status": "bevestigd" of "onzeker" of "onjuist" of "niet_verifieerbaar",
       "uitleg": "Korte uitleg max 100 tekens",
       "citaat": "Relevant citaat uit de bron max 120 tekens of lege string",
-      "bron_url": "URL van de gebruikte bron of lege string"
+      "bron_url": "URL van de gebruikte bron of lege string",
+      "bijgewerkt": false
     }
   ],
-  "conclusie": "2-3 zinnen overall conclusie over de betrouwbaarheid van de pagina"
+  "conclusie": "2-3 zinnen overall conclusie over de betrouwbaarheid van de website"
 }
 
 Regels voor status:
@@ -72,6 +75,33 @@ Regels voor status:
 - "niet_verifieerbaar": de bron bevat geen relevante informatie over deze bewering
 
 Overall oordeel: "betrouwbaar" als meer dan 70% bevestigd, "onbetrouwbaar" als meer dan 30% onjuist, anders "twijfelachtig".`
+
+const REFINEMENT_PROMPT = `Je bent een nauwkeurige fact-checker. Je heroverweegt specifieke beweringen die eerder onzeker of niet-verifieerbaar waren.
+
+Je krijgt:
+1. Een lijst van beweringen die eerder "onzeker" of "niet_verifieerbaar" waren
+2. Aanvullende tekst uit andere officiële documentatiebronnen
+
+Heroverweeg elke bewering op basis van de nieuwe bronteksten.
+
+Reageer UITSLUITEND met geldige JSON — geen uitleg, geen markdown, geen backticks.
+
+Formaat:
+{
+  "updates": [
+    {
+      "id": 1,
+      "status": "bevestigd" of "onzeker" of "onjuist" of "niet_verifieerbaar",
+      "uitleg": "Korte uitleg max 100 tekens",
+      "citaat": "Relevant citaat uit de nieuwe bron max 120 tekens of lege string",
+      "bron_url": "URL van de gebruikte nieuwe bron of lege string",
+      "bijgewerkt": true
+    }
+  ]
+}
+
+Geef alleen een update terug voor beweringen waarbij je nieuwe relevante informatie hebt gevonden.
+Als de nieuwe bronnen geen relevante informatie bevatten voor een bewering, laat die dan weg uit de updates array.`
 
 function stripHtml(html) {
   return html
@@ -96,7 +126,46 @@ function parseJson(text) {
   return JSON.parse(clean.slice(start, end + 1))
 }
 
-async function fetchSource(url) {
+function extractInternalLinks(html, baseUrl) {
+  let origin
+  try {
+    origin = new URL(baseUrl).origin
+  } catch {
+    return []
+  }
+
+  const EXCLUDE = /\/(privacy|terms|contact|login|register|signup|logout|sitemap|feed|rss|cookie|legal|impressum|disclaimer)\b/i
+  const CONTENT_BOOST = /\/(learn|guide|how|feature|docs|about|faq|help|product|service|platform|solution|module|training|course|lesson)/i
+
+  const linkPattern = /href=["']([^"'#?]+)/gi
+  const seen = new Set([baseUrl])
+  const candidates = []
+
+  let match
+  while ((match = linkPattern.exec(html)) !== null) {
+    try {
+      const fullUrl = new URL(match[1], baseUrl).href
+      const parsed = new URL(fullUrl)
+      if (parsed.origin !== origin) continue
+      if (seen.has(fullUrl)) continue
+      if (EXCLUDE.test(parsed.pathname)) continue
+      seen.add(fullUrl)
+
+      const score =
+        (CONTENT_BOOST.test(parsed.pathname) ? 2 : 0) +
+        (parsed.pathname.split('/').filter(Boolean).length <= 2 ? 1 : 0)
+
+      candidates.push({ url: fullUrl, score })
+    } catch {}
+  }
+
+  return candidates
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3)
+    .map(c => c.url)
+}
+
+async function fetchSource(url, maxChars = 8000) {
   try {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 10000)
@@ -107,10 +176,20 @@ async function fetchSource(url) {
     clearTimeout(timeout)
     if (!res.ok) return { url, text: '', error: `HTTP ${res.status}` }
     const html = await res.text()
-    return { url, text: stripHtml(html).slice(0, 8000) }
+    return { url, text: stripHtml(html).slice(0, maxChars) }
   } catch (err) {
     return { url, text: '', error: err.message }
   }
+}
+
+function herberekeneOordeel(items) {
+  const total = items.length
+  if (total === 0) return 'twijfelachtig'
+  const bevestigd = items.filter(i => i.status === 'bevestigd').length
+  const onjuist = items.filter(i => i.status === 'onjuist').length
+  if (bevestigd / total > 0.7) return 'betrouwbaar'
+  if (onjuist / total > 0.3) return 'onbetrouwbaar'
+  return 'twijfelachtig'
 }
 
 export default async function handler(req, res) {
@@ -125,8 +204,8 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: 'ANTHROPIC_API_KEY niet ingesteld op de server' })
   }
 
-  // Stap 1: Haal de doelpagina op
-  let pageText
+  // ─── FASE 0: Hoofdpagina + sub-pagina's ophalen ───
+  let pageHtml, pageText, subPageUrls = [], subPageTexts = []
   try {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 10000)
@@ -138,10 +217,16 @@ export default async function handler(req, res) {
     if (!pageRes.ok) {
       return res.status(502).json({ error: `Pagina niet bereikbaar: HTTP ${pageRes.status}` })
     }
-    const html = await pageRes.text()
-    pageText = stripHtml(html).slice(0, 12000)
+    pageHtml = await pageRes.text()
+    pageText = stripHtml(pageHtml).slice(0, 12000)
     if (!pageText || pageText.length < 50) {
       return res.status(502).json({ error: 'Pagina bevat geen leesbare tekst' })
+    }
+
+    subPageUrls = extractInternalLinks(pageHtml, url)
+    if (subPageUrls.length > 0) {
+      const subResults = await Promise.all(subPageUrls.map(u => fetchSource(u, 5000)))
+      subPageTexts = subResults.filter(r => r.text)
     }
   } catch (err) {
     if (err.name === 'AbortError') {
@@ -150,14 +235,19 @@ export default async function handler(req, res) {
     return res.status(502).json({ error: `Pagina ophalen mislukt: ${err.message}` })
   }
 
-  // Stap 2: Fase 1 — claim-extractie
+  // ─── FASE 1: Claim-extractie ───
   let claims
   try {
+    const combinedText = [
+      `=== Hoofdpagina: ${url} ===\n${pageText}`,
+      ...subPageTexts.map(s => `=== Sub-pagina: ${s.url} ===\n${s.text}`),
+    ].join('\n\n')
+
     const claimsRes = await client.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 2048,
       system: [{ type: 'text', text: CLAIM_EXTRACTION_PROMPT, cache_control: { type: 'ephemeral' } }],
-      messages: [{ role: 'user', content: `URL: ${url}\n\nPaginatekst:\n${pageText}` }],
+      messages: [{ role: 'user', content: `URL: ${url}\n\nWebsite-inhoud:\n${combinedText}` }],
     })
     const claimsText = (claimsRes.content || []).filter(b => b.type === 'text').map(b => b.text).join('')
     claims = parseJson(claimsText)
@@ -172,27 +262,23 @@ export default async function handler(req, res) {
       oordeel: 'twijfelachtig',
       items: [],
       bronnen: [],
-      conclusie: 'Er zijn geen verifieerbare feitelijke beweringen gevonden op deze pagina.',
+      subPaginas: subPageTexts.map(s => s.url),
+      iteraties: 1,
+      conclusie: 'Er zijn geen verifieerbare feitelijke beweringen gevonden op deze website.',
     })
   }
 
-  // Stap 3: Bronnen ophalen (max 3 unieke URLs, parallel)
-  const uniqueUrls = [...new Set(claims.beweringen.flatMap(b => b.bron_urls || []))].slice(0, 3)
-  const bronResults = await Promise.all(uniqueUrls.map(fetchSource))
-  const bronnen = bronResults.filter(b => b.text)
-
-  // Stap 4: Fase 2 — feitcontrole
+  // ─── FASE 2: Initiële feitcontrole ───
   let factCheck
+  const fase2Urls = [...new Set(
+    claims.beweringen.flatMap(b => b.bron_urls?.[0] ? [b.bron_urls[0]] : [])
+  )].slice(0, 3)
+  const fase2Bronnen = (await Promise.all(fase2Urls.map(u => fetchSource(u)))).filter(b => b.text)
+
   try {
-    const bronText = bronnen.map((b, i) =>
-      `--- Bron ${i + 1}: ${b.url} ---\n${b.text}`
-    ).join('\n\n')
-
-    const beweringenText = claims.beweringen.map(b =>
-      `[${b.id}] ${b.tekst}`
-    ).join('\n')
-
-    const userMsg = `Originele pagina: ${url}\n\nOnderwerp: ${claims.onderwerp}\n\nBeweringen:\n${beweringenText}\n\nBronmateriaal:\n${bronText || 'Geen bronnen beschikbaar.'}`
+    const bronText = fase2Bronnen.map((b, i) => `--- Bron ${i + 1}: ${b.url} ---\n${b.text}`).join('\n\n')
+    const beweringenText = claims.beweringen.map(b => `[${b.id}] ${b.tekst}`).join('\n')
+    const userMsg = `Originele website: ${url}\nOnderwerp: ${claims.onderwerp}\n\nBeweringen:\n${beweringenText}\n\nBronmateriaal:\n${bronText || 'Geen bronnen beschikbaar.'}`
 
     const factRes = await client.messages.create({
       model: 'claude-sonnet-4-6',
@@ -202,13 +288,75 @@ export default async function handler(req, res) {
     })
     const factText = (factRes.content || []).filter(b => b.type === 'text').map(b => b.text).join('')
     factCheck = parseJson(factText)
+    factCheck.items = (factCheck.items || []).map(i => ({ ...i, bijgewerkt: false }))
   } catch (err) {
     console.error('Fase 2 fout:', err)
     return res.status(502).json({ error: 'Feitcontrole mislukt: ' + err.message })
   }
 
+  // ─── FASE 3: Iteratieve verdieping ───
+  let iteraties = 1
+  const onzekereItems = factCheck.items.filter(
+    i => i.status === 'onzeker' || i.status === 'niet_verifieerbaar'
+  )
+
+  if (onzekereItems.length > 0) {
+    const al_gefetcht = new Set(fase2Urls)
+    const extraUrls = []
+
+    for (const item of onzekereItems) {
+      const claim = claims.beweringen.find(b => b.id === item.id)
+      if (!claim) continue
+      for (const fallbackUrl of (claim.bron_urls || []).slice(1)) {
+        if (!al_gefetcht.has(fallbackUrl) && extraUrls.length < 2) {
+          extraUrls.push(fallbackUrl)
+          al_gefetcht.add(fallbackUrl)
+        }
+      }
+    }
+
+    if (extraUrls.length > 0) {
+      const extraBronnen = (await Promise.all(extraUrls.map(u => fetchSource(u)))).filter(b => b.text)
+
+      if (extraBronnen.length > 0) {
+        try {
+          const extraBronText = extraBronnen.map((b, i) =>
+            `--- Extra bron ${i + 1}: ${b.url} ---\n${b.text}`
+          ).join('\n\n')
+          const onzekereText = onzekereItems.map(i =>
+            `[${i.id}] ${i.bewering} (huidig: ${i.status})`
+          ).join('\n')
+          const refineMsg = `Onzekere/niet-verifieerbare beweringen:\n${onzekereText}\n\nAanvullende bronnen:\n${extraBronText}`
+
+          const refineRes = await client.messages.create({
+            model: 'claude-sonnet-4-6',
+            max_tokens: 2048,
+            system: [{ type: 'text', text: REFINEMENT_PROMPT, cache_control: { type: 'ephemeral' } }],
+            messages: [{ role: 'user', content: refineMsg }],
+          })
+          const refineText = (refineRes.content || []).filter(b => b.type === 'text').map(b => b.text).join('')
+          const refined = parseJson(refineText)
+
+          for (const update of (refined.updates || [])) {
+            const idx = factCheck.items.findIndex(i => i.id === update.id)
+            if (idx >= 0) {
+              factCheck.items[idx] = { ...factCheck.items[idx], ...update, bijgewerkt: true }
+            }
+          }
+
+          factCheck.oordeel = herberekeneOordeel(factCheck.items)
+          iteraties = 2
+        } catch (err) {
+          console.error('Fase 3 fout (non-fatal):', err)
+        }
+      }
+    }
+  }
+
   return res.status(200).json({
     ...factCheck,
-    bronnen: bronnen.map(b => b.url),
+    bronnen: fase2Bronnen.map(b => b.url),
+    subPaginas: subPageTexts.map(s => s.url),
+    iteraties,
   })
 }
